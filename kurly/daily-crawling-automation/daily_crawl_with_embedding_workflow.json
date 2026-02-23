@@ -1,0 +1,514 @@
+{
+  "name": "컬리 스킨케어 일일 크롤링 & 임베딩 (Postgres 증분 + Qdrant)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 * * *"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300],
+      "id": "cron-trigger-daily",
+      "name": "Daily Cron (12:00 KST)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 워크플로우 시작 시간 기록\nconst startTime = new Date().toISOString();\nconst dateStr = new Date().toISOString().split('T')[0];\n\nreturn [{\n  json: {\n    startTime: startTime,\n    date: dateStr,\n    status: 'started'\n  }\n}];"
+      },
+      "id": "init-workflow",
+      "name": "Init Workflow",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8008/crawl/incremental",
+        "authentication": "none",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ timeoutSeconds: 7200 }) }}",
+        "options": { "timeout": 7200000 }
+      },
+      "id": "execute-crawler",
+      "name": "Execute Crawler",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Execute Crawler 응답의 delta 사용 (파일 읽기 없음)\nconst resp = $input.item.json;\nconst delta = resp.delta || { products: [], reviews: [], stats: {} };\n\nconst products = Array.isArray(delta.products) ? delta.products : [];\nconst reviews = Array.isArray(delta.reviews) ? delta.reviews : [];\nconst rawStats = delta.stats || {};\nconst stats = {\n  newProductCount: rawStats.newProductCount ?? products.length,\n  newReviewCount: rawStats.newReviewCount ?? reviews.length,\n  totalProducts: rawStats.totalProductsInCategory ?? 0\n};\nif (typeof $workflow !== 'undefined' && $workflow.staticData != null) {\n  $workflow.staticData.stats = stats;\n}\n\nreturn [{\n  json: {\n    products,\n    reviews,\n    stats,\n    hasNewData: products.length > 0 || reviews.length > 0\n  }\n}];"
+      },
+      "id": "parse-crawled-data",
+      "name": "Parse Delta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "check-new-data",
+              "leftValue": "={{ $json.hasNewData }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-has-new-data",
+      "name": "Check Has New Data",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Delta products를 개별 아이템으로 (Upsert용)\nconst products = $input.item.json.products || [];\nreturn products.map(p => ({\n  json: {\n    product_no: String(p.product_no),\n    product_name: p.product_name || '',\n    review_count: Number(p.review_count) || 0,\n    short_description: p.short_description || '',\n    product_image_url: p.product_image_url || '',\n    sales_price: Number(p.sales_price) || 0,\n    discounted_price: Number(p.discounted_price) || 0,\n    product_notice_notices: typeof p.product_notice_notices === 'string' ? p.product_notice_notices : JSON.stringify(p.product_notice_notices || [])\n  }\n}));"
+      },
+      "id": "split-new-products",
+      "name": "Split New Products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO kurly_skin_products (product_no, product_name, review_count, short_description, product_image_url, sales_price, discounted_price, product_notice_notices)\nVALUES (\n  '{{ $json.product_no.replace(/'/g, \"''\") }}',\n  '{{ ($json.product_name || '').replace(/'/g, \"''\") }}',\n  {{ $json.review_count || 0 }},\n  '{{ ($json.short_description || '').replace(/'/g, \"''\") }}',\n  '{{ ($json.product_image_url || '').replace(/'/g, \"''\") }}',\n  {{ $json.sales_price || 0 }},\n  {{ $json.discounted_price || 0 }},\n  '{{ ($json.product_notice_notices || '[]').replace(/'/g, \"''\") }}'::jsonb\n)\nON CONFLICT (product_no) DO UPDATE SET\n  product_name = EXCLUDED.product_name,\n  review_count = EXCLUDED.review_count,\n  short_description = EXCLUDED.short_description,\n  product_image_url = EXCLUDED.product_image_url,\n  sales_price = EXCLUDED.sales_price,\n  discounted_price = EXCLUDED.discounted_price,\n  product_notice_notices = EXCLUDED.product_notice_notices,\n  updated_at = CURRENT_TIMESTAMP",
+        "options": {}
+      },
+      "id": "insert-new-products",
+      "name": "Upsert Products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [2220, 200],
+      "credentials": {
+        "postgres": {
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Delta reviews를 개별 아이템으로 (Ollama 배치 입력용)\nconst reviews = $input.item.json.reviews || [];\nif (reviews.length === 0) return [];\nreturn reviews.map(r => ({\n  json: {\n    product_no: String(r.product_no),\n    contents: r.contents || '',\n    registered_at: r.registeredAt || null,\n    review_score: 3\n  }\n}));"
+      },
+      "id": "split-new-reviews",
+      "name": "Split New Reviews",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 400]
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "id": "split-review-batches",
+      "name": "Split Review Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [2120, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 현재 배치 리뷰를 qwen2.5 감성 분석용 프롬프트로 변환\nconst items = $input.all();\nconst reviews = items.map((item, idx) => ({ id: idx, text: item.json.contents }));\nconst prompt = `당신은 한국어 쇼핑몰 리뷰 분석 전문가입니다.\n다음 제공된 ${reviews.length}개의 리뷰를 분석하여 [1-5점] 사이의 감성 점수를 매기세요.\n\n### [평가 기준]\n- 5점: 매우 만족 (재구매, 쟁여템, 강력 추천, 최고, 짱, 굳, 완전 추천, 애정템, 👍😊)\n- 4점: 만족 (좋아요, 잘 쓰는 중, 가성비 만족, 괜찮아요, 만족해요)\n- 3점: 보통 (무난함, 그냥 그래요, 필요해서 샀어요, 애매한 평가)\n- 2점: 불만족 (아쉬움, 기대 이하, 별로)\n- 1점: 매우 불만족 (부작용/트러블, 화끈거림, 최악, 환불, 사용 중단, 주변에 줘요)\n\n### [중요 규칙]\n- \"재구매\", \"쟁여템\", \"애정템\"은 무조건 5점.\n- \"트러블\", \"화끈거림\", \"따가워요\" 등 피부 이상 반응은 무조건 1점.\n- \"주변에 줬어요\", \"안 써요\" 등 사용 중단은 1점.\n\n### [분석할 리뷰 목록]\n${JSON.stringify(reviews, null, 2)}\n\n### [출력 형식]\n반드시 아래 JSON 형식으로만 답변하세요. 다른 설명은 생략하고 JSON만 출력하세요.\n[ {\"id\": 0, \"reason\": \"짧은 이유\", \"score\": 5}, ... ]\n\n답변:`;\nreturn [{ json: { prompt, batchData: items.map(i => i.json), batchSize: reviews.length } }];"
+      },
+      "id": "prepare-batch-prompt",
+      "name": "Prepare Batch Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2340, 400]
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "value": "qwen2.5:3b", "mode": "list", "cachedResultName": "qwen2.5:3b" },
+        "messages": { "values": [{ "content": "={{ $json.prompt }}" }] },
+        "options": { "temperature": 0 }
+      },
+      "type": "@n8n/n8n-nodes-langchain.ollama",
+      "typeVersion": 1,
+      "position": [2560, 400],
+      "id": "ollama-review-analysis",
+      "name": "Ollama Review Analysis",
+      "credentials": { "ollamaApi": { "name": "Local Ollama service" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ollama 응답에서 JSON 배열 파싱 후 배치 리뷰에 점수 부여\nconst responseText = $json.content ? $json.content.trim() : '';\nconst batchData = $('Prepare Batch Prompt').item.json.batchData;\nlet scores = [];\ntry {\n  const jsonMatch = responseText.match(/\\[[\\s\\S]*\\]/);\n  if (jsonMatch) {\n    const results = JSON.parse(jsonMatch[0]);\n    scores = results.sort((a, b) => a.id - b.id).map(r => { const s = r.score || 3; return (s >= 1 && s <= 5) ? s : 3; });\n  } else {\n    const numbers = responseText.match(/[1-5]/g);\n    if (numbers) scores = numbers.map(n => parseInt(n));\n  }\n} catch (e) {\n  const numbers = responseText.match(/[1-5]/g);\n  if (numbers) scores = numbers.map(n => parseInt(n));\n}\nif (scores.length < batchData.length) scores = scores.concat(Array(batchData.length - scores.length).fill(3));\nelse if (scores.length > batchData.length) scores = scores.slice(0, batchData.length);\nreturn batchData.map((data, idx) => ({\n  json: {\n    ...data,\n    contents: (data.contents || '').replace(/\\0/g, '').replace(/[\\x00-\\x1F\\x7F]/g, ' ').trim(),\n    review_score: (scores[idx] >= 1 && scores[idx] <= 5) ? scores[idx] : 3\n  }\n}));"
+      },
+      "id": "parse-batch-results",
+      "name": "Parse Batch Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2780, 400]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "list"
+        },
+        "table": {
+          "__rl": true,
+          "value": "kurly_skin_reviews",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "product_no": "={{ $json.product_no }}",
+            "contents": "={{ $json.contents }}",
+            "review_score": "={{ $json.review_score ?? 3 }}",
+            "registered_at": "={{ $json.registered_at }}"
+          },
+          "matchingColumns": ["id"],
+          "schema": [
+            { "id": "id", "displayName": "id", "required": false, "defaultMatch": true, "display": true, "type": "number", "canBeUsedToMatch": true, "removed": true },
+            { "id": "product_no", "displayName": "product_no", "required": true, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "contents", "displayName": "contents", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "review_score", "displayName": "review_score", "required": false, "defaultMatch": false, "display": true, "type": "number", "canBeUsedToMatch": true },
+            { "id": "registered_at", "displayName": "registered_at", "required": false, "defaultMatch": false, "display": true, "type": "dateTime", "canBeUsedToMatch": true },
+            { "id": "created_at", "displayName": "created_at", "required": false, "defaultMatch": false, "display": true, "type": "dateTime", "canBeUsedToMatch": true, "removed": true }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": { "mode": "independently" }
+      },
+      "id": "insert-new-reviews",
+      "name": "Insert New Reviews",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [2220, 400],
+      "credentials": {
+        "postgres": {
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Delta products로부터 임베딩용 아이템 생성 (initial_embedding.py notice 로직)\nfunction noticeJsonToText(notices) {\n  if (!notices || !Array.isArray(notices)) return '';\n  const sentences = [];\n  for (const item of notices) {\n    const title = (item.title || '').trim();\n    const desc = (item.description || '').trim();\n    if (!title || !desc) continue;\n    const cleanTitle = title.replace(/｢화장품법｣에 따라 /g, '').replace(/｢화장품법｣에 따른 /g, '');\n    const cleanDesc = desc.replace(/\\\\n/g, ' ').trim();\n    if (title.includes('용량') || title.includes('중량')) sentences.push(`내용물의 용량은 ${cleanDesc}입니다.`);\n    else if (title.includes('피부타입') || title.includes('사양')) sentences.push(`${cleanDesc}에 사용 가능한 제품입니다.`);\n    else if (title.includes('사용방법')) sentences.push(`사용 방법은 ${cleanDesc}.`);\n    else if (title.includes('제조국')) sentences.push(`제조국은 ${cleanDesc}입니다.`);\n    else if (title.includes('기능성')) sentences.push(`${cleanDesc} 제품입니다.`);\n    else if (title.includes('성분')) { const shortDesc = cleanDesc.length > 200 ? cleanDesc.substring(0, 200) + '...' : cleanDesc; sentences.push(`주요 성분은 ${shortDesc}입니다.`); }\n    else if (title.includes('주의사항')) sentences.push(`사용 시 주의사항은 다음과 같습니다. ${cleanDesc}`);\n    else sentences.push(`${cleanTitle}은 ${cleanDesc}입니다.`);\n  }\n  return sentences.join(' ');\n}\nconst products = $input.item.json.products || [];\nconst out = [];\nfor (const p of products) {\n  let notices = Array.isArray(p.product_notice_notices) ? p.product_notice_notices : [];\n  try { if (typeof p.product_notice_notices === 'string') notices = JSON.parse(p.product_notice_notices || '[]'); } catch (e) {}\n  const noticeText = noticeJsonToText(notices);\n  const embeddingText = `상품명: ${p.product_name || ''}\\n설명: ${p.short_description || ''}\\n\\n${noticeText}`;\n  out.push({\n    json: {\n      id: parseInt(p.product_no),\n      text: embeddingText,\n      payload: {\n        type: 'product',\n        product_no: String(p.product_no),\n        product_name: p.product_name || '',\n        sales_price: p.sales_price || 0,\n        discounted_price: p.discounted_price || 0,\n        review_count: p.review_count || 0,\n        product_image_url: p.product_image_url || '',\n        price: (p.discounted_price > 0 ? p.discounted_price : p.sales_price) || 0,\n        has_discount: p.discounted_price > 0 && p.discounted_price < (p.sales_price || 0),\n        indexed_at: new Date().toISOString()\n      }\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "prepare-product-embeddings",
+      "name": "Prepare Product Embeddings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 단일 리뷰 아이템(Parse Batch Results 출력)으로부터 임베딩용 1건 생성 (Ollama 평가 점수 반영)\nconst crypto = require('crypto');\nconst r = $input.item.json;\nconst contents = (r.contents || '').trim();\nif (!contents) return [];\nconst productNo = String(r.product_no);\nconst regAt = r.registered_at != null ? String(r.registered_at) : '';\nconst hash = crypto.createHash('sha256').update(productNo + regAt + contents).digest('hex').substring(0, 16);\nconst pointId = 'r_' + hash;\nreturn [{\n  json: {\n    id: pointId,\n    text: contents,\n    payload: {\n      type: 'review',\n      product_no: productNo,\n      review_score: (r.review_score >= 1 && r.review_score <= 5) ? r.review_score : 3,\n      registered_at: regAt ? regAt.substring(0, 10) : null,\n      indexed_at: new Date().toISOString(),\n      contents: contents.length <= 500 ? contents : contents.substring(0, 500) + '…'\n    }\n  }\n}];"
+      },
+      "id": "prepare-review-embeddings",
+      "name": "Prepare Review Embeddings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 400]
+    },
+    {
+      "parameters": {
+        "url": "http://ollama:11434/api/embed",
+        "authentication": "none",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'bge-m3', input: $json.text }) }}",
+        "options": {}
+      },
+      "id": "generate-product-embeddings",
+      "name": "Generate Product Embeddings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3320, 200],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "http://ollama:11434/api/embed",
+        "authentication": "none",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'bge-m3', input: $json.text }) }}",
+        "options": {}
+      },
+      "id": "generate-review-embeddings",
+      "name": "Generate Review Embeddings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3320, 400],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ollama 응답에서 벡터 추출 및 Qdrant 저장 준비\nconst embeddingResponse = $input.item.json;\nconst originalData = $('Prepare Product Embeddings').item.json;\n\nif (!embeddingResponse.embeddings || !Array.isArray(embeddingResponse.embeddings) || embeddingResponse.embeddings.length === 0) {\n  throw new Error('임베딩 생성 실패: 응답에 벡터가 없습니다.');\n}\n\nconst vector = embeddingResponse.embeddings[0];\n\nreturn [{\n  json: {\n    point_id: originalData.id,\n    vector: vector,\n    payload: originalData.payload\n  }\n}];"
+      },
+      "id": "process-product-embedding",
+      "name": "Process Product Embedding",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3540, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ollama 응답에서 벡터 추출 및 Qdrant 저장 준비\nconst embeddingResponse = $input.item.json;\nconst originalData = $('Prepare Review Embeddings').item.json;\n\nif (!embeddingResponse.embeddings || !Array.isArray(embeddingResponse.embeddings) || embeddingResponse.embeddings.length === 0) {\n  throw new Error('임베딩 생성 실패: 응답에 벡터가 없습니다.');\n}\n\nconst vector = embeddingResponse.embeddings[0];\n\nreturn [{\n  json: {\n    point_id: originalData.id,\n    vector: vector,\n    payload: originalData.payload\n  }\n}];"
+      },
+      "id": "process-review-embedding",
+      "name": "Process Review Embedding",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3540, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Qdrant upsert 형식으로 변환\nconst pointId = $json.point_id;\nconst vector = $json.vector;\nconst payload = $json.payload;\n\nconst qdrantPoint = {\n  id: pointId,\n  vector: vector,\n  payload: payload\n};\n\nreturn [{ json: { point: qdrantPoint } }];"
+      },
+      "id": "format-product-point",
+      "name": "Format Product Point",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3760, 200]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:6333/collections/kurly_skin/points",
+        "method": "PUT",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ points: [$json.point] }) }}",
+        "options": {}
+      },
+      "id": "upsert-product-to-qdrant",
+      "name": "Upsert Product To Qdrant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3980, 200],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Qdrant upsert 형식으로 변환\nconst pointId = $json.point_id;\nconst vector = $json.vector;\nconst payload = $json.payload;\n\nconst qdrantPoint = {\n  id: pointId,\n  vector: vector,\n  payload: payload\n};\n\nreturn [{ json: { point: qdrantPoint } }];"
+      },
+      "id": "format-review-point",
+      "name": "Format Review Point",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3760, 400]
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:6333/collections/kurly_skin/points",
+        "method": "PUT",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ points: [$json.point] }) }}",
+        "options": {}
+      },
+      "id": "upsert-review-to-qdrant",
+      "name": "Upsert Review To Qdrant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3980, 400],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 2,
+        "options": {}
+      },
+      "id": "merge-embedding-outputs",
+      "name": "Merge Embedding Outputs",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [4200, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge 결과 중 1개만 전달하여 Collect Embedding Stats가 한 번만 실행되도록\nreturn [$input.first()];"
+      },
+      "id": "take-first-item",
+      "name": "Take First Item",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4310, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 임베딩 완료 통계 수집\nconst stats = $workflow.staticData.stats || { newProductCount: 0, newReviewCount: 0, totalProducts: 0 };\nconst productResults = $('Upsert Product To Qdrant').all();\nconst reviewResults = $('Upsert Review To Qdrant').all();\n\nconst embeddingStats = {\n  productEmbeddingSuccess: productResults.filter(r => !r.json.error).length,\n  productEmbeddingFailed: productResults.filter(r => r.json.error).length,\n  reviewEmbeddingSuccess: reviewResults.filter(r => !r.json.error).length,\n  reviewEmbeddingFailed: reviewResults.filter(r => r.json.error).length\n};\n\nreturn [{\n  json: {\n    stats: stats,\n    ...embeddingStats,\n    embeddingComplete: true\n  }\n}];"
+      },
+      "id": "collect-embedding-stats",
+      "name": "Collect Embedding Stats",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4420, 300]
+    },
+    {
+      "parameters": {
+        "channel": "#general",
+        "text": "={{ ($json.stats && ($json.stats.newProductCount > 0 || $json.stats.newReviewCount > 0)) ? `🎉 *컬리 스킨케어 데이터 크롤링 완료!*\n\n📅 *날짜:* ${$('Init Workflow').item.json.date ?? 'N/A'}\n\n📊 *오늘의 업데이트:*\n• 🆕 새로운 제품: *${$json.stats.newProductCount ?? 0}개*\n• 💬 새로운 리뷰: *${$json.stats.newReviewCount ?? 0}개*\n• 📦 전체 제품 수: *${$json.stats.totalProducts ?? 0}개*\n\n✅ *PostgreSQL 적재:* 성공\n✅ *Qdrant 임베딩:*\n  - Product: ${$json.productEmbeddingSuccess ?? 0}개 성공, ${$json.productEmbeddingFailed ?? 0}개 실패\n  - Review: ${$json.reviewEmbeddingSuccess ?? 0}개 성공, ${$json.reviewEmbeddingFailed ?? 0}개 실패` : `ℹ️ *컬리 스킨케어 - 새 데이터 없음*\n\n📅 *날짜:* ${$('Init Workflow').item.json.date ?? 'N/A'}\n\n📊 *결과:*\n• 🆕 새로운 제품: *0개*\n• 💬 새로운 리뷰: *0개*\n• 📦 전체 제품 수: *${($json.stats && $json.stats.totalProducts) ?? 0}개*\n\n✅ 새로운 데이터가 없습니다. 모든 데이터가 최신 상태입니다.` }}",
+        "otherOptions": {}
+      },
+      "id": "slack-success-notification",
+      "name": "Slack Success Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [4640, 300],
+      "credentials": {
+        "slackApi": {
+          "name": "Slack account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "channel": "#general",
+        "text": "❌ *컬리 스킨케어 크롤링 실패!*\n\n📅 *날짜:* {{ $('Init Workflow').item.json.date }}\n⏰ *시간:* {{ new Date().toLocaleTimeString('ko-KR') }}\n\n🚨 *오류 유형:* {{ $json.error?.message || '알 수 없는 오류' }}\n📍 *오류 발생 위치:* {{ $json.error?.node || '워크플로우' }}\n\n💥 *오류 메시지:*\n```\n{{ $json.error?.message || '상세 정보 없음' }}\n```\n\n⚠️ 워크플로우를 확인하고 다시 실행해주세요!",
+        "otherOptions": {}
+      },
+      "id": "slack-error-notification",
+      "name": "Slack Error Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [4640, 500],
+      "credentials": {
+        "slackApi": {
+          "name": "Slack account"
+        }
+      },
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Daily Cron (12:00 KST)": {
+      "main": [[{ "node": "Init Workflow", "type": "main", "index": 0 }]]
+    },
+    "Init Workflow": {
+      "main": [[{ "node": "Execute Crawler", "type": "main", "index": 0 }]]
+    },
+    "Execute Crawler": {
+      "main": [[{ "node": "Parse Delta", "type": "main", "index": 0 }]]
+    },
+    "Parse Delta": {
+      "main": [[{ "node": "Check Has New Data", "type": "main", "index": 0 }]]
+    },
+    "Check Has New Data": {
+      "main": [
+        [
+          { "node": "Split New Products", "type": "main", "index": 0 },
+          { "node": "Split New Reviews", "type": "main", "index": 0 },
+          { "node": "Prepare Product Embeddings", "type": "main", "index": 0 }
+        ],
+        [{ "node": "Slack Success Notification", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split New Products": {
+      "main": [[{ "node": "Upsert Products", "type": "main", "index": 0 }]]
+    },
+    "Upsert Products": {
+      "main": [[]]
+    },
+    "Split New Reviews": {
+      "main": [[{ "node": "Split Review Batches", "type": "main", "index": 0 }]]
+    },
+    "Split Review Batches": {
+      "main": [
+        [[{ "node": "Prepare Batch Prompt", "type": "main", "index": 0 }]],
+        []
+      ]
+    },
+    "Prepare Batch Prompt": {
+      "main": [[{ "node": "Ollama Review Analysis", "type": "main", "index": 0 }]]
+    },
+    "Ollama Review Analysis": {
+      "main": [[{ "node": "Parse Batch Results", "type": "main", "index": 0 }]]
+    },
+    "Parse Batch Results": {
+      "main": [
+        [
+          { "node": "Insert New Reviews", "type": "main", "index": 0 },
+          { "node": "Prepare Review Embeddings", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Insert New Reviews": {
+      "main": [[{ "node": "Split Review Batches", "type": "main", "index": 0 }]]
+    },
+    "Prepare Product Embeddings": {
+      "main": [[{ "node": "Generate Product Embeddings", "type": "main", "index": 0 }]]
+    },
+    "Generate Product Embeddings": {
+      "main": [[{ "node": "Process Product Embedding", "type": "main", "index": 0 }]]
+    },
+    "Process Product Embedding": {
+      "main": [[{ "node": "Format Product Point", "type": "main", "index": 0 }]]
+    },
+    "Format Product Point": {
+      "main": [[{ "node": "Upsert Product To Qdrant", "type": "main", "index": 0 }]]
+    },
+    "Upsert Product To Qdrant": {
+      "main": [[{ "node": "Merge Embedding Outputs", "type": "main", "index": 0 }]]
+    },
+    "Prepare Review Embeddings": {
+      "main": [[{ "node": "Generate Review Embeddings", "type": "main", "index": 0 }]]
+    },
+    "Generate Review Embeddings": {
+      "main": [[{ "node": "Process Review Embedding", "type": "main", "index": 0 }]]
+    },
+    "Process Review Embedding": {
+      "main": [[{ "node": "Format Review Point", "type": "main", "index": 0 }]]
+    },
+    "Format Review Point": {
+      "main": [[{ "node": "Upsert Review To Qdrant", "type": "main", "index": 0 }]]
+    },
+    "Upsert Review To Qdrant": {
+      "main": [[{ "node": "Merge Embedding Outputs", "type": "main", "index": 0 }]]
+    },
+    "Merge Embedding Outputs": {
+      "main": [[{ "node": "Take First Item", "type": "main", "index": 0 }]]
+    },
+    "Take First Item": {
+      "main": [[{ "node": "Collect Embedding Stats", "type": "main", "index": 0 }]]
+    },
+    "Collect Embedding Stats": {
+      "main": [[{ "node": "Slack Success Notification", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Seoul"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2026-02-06T00:00:00.000Z",
+  "versionId": "1"
+}
