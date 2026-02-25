@@ -5,6 +5,7 @@
 ## 현재 프로젝트
 
 ### Docker Data Stack
+- 매일 증분 데이터 적재 자동화 파이프라인
 - PostgreSQL + Qdrant 데이터 적재 파이프라인
 - Docker Compose 기반 환경 구성
 
