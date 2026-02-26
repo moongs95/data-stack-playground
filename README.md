@@ -21,6 +21,8 @@ git clone https://github.com/[username]/data-stack-playground.git
 ```
 .
 ├── docker-postgres-qdrant/   # PostgreSQL + Qdrant 데이터 파이프라인
+├── initial
+├── daliy
 └── ...                        # 추후 추가될 프로젝트들
 ```
 
@@ -28,3 +30,4 @@ git clone https://github.com/[username]/data-stack-playground.git
 - Docker & Docker Compose
 - PostgreSQL
 - Qdrant
+- n8n
